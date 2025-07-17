@@ -86,6 +86,7 @@ class VisionProcesser():
         self.track_video_fps = conf.get('track_video_fps', 25)
         self.include_audio_in_tracks = conf.get('include_audio_in_tracks', True)
         self.save_track_metadata = conf.get('save_track_metadata', True)
+        self.min_avg_score_threshold = conf.get('min_avg_score_threshold', 0.5)
 
         if self.out_video_path is not None:
             # save the active face detection results video (for debugging).
@@ -353,22 +354,30 @@ class VisionProcesser():
     
     def save_face_tracks(self):
         """Save individual face tracks as MP4 files with audio"""
-        print(f"Saving {len(self.all_tracks_data)} face tracks to {self.face_track_dir}")
+        # Filter tracks based on average score threshold
+        filtered_tracks = []
+        for track_data in self.all_tracks_data:
+            avg_score = float(np.mean(track_data['scores']))
+            if avg_score >= self.min_avg_score_threshold:
+                filtered_tracks.append(track_data)
+        
+        print(f"Saving {len(filtered_tracks)} face tracks (out of {len(self.all_tracks_data)} total) with avg score >= {self.min_avg_score_threshold} to {self.face_track_dir}")
         
         track_metadata = []
         
-        for track_idx, track_data in enumerate(self.all_tracks_data):
+        for track_idx, track_data in enumerate(filtered_tracks):
             # Extract track information
             track_info = track_data['track_info']
             video_frames = track_data['video_frames']
             audio_segment = track_data['audio']
             scores = track_data['scores']
             frame_start = track_data['frame_start']
+            original_track_idx = track_data['track_idx']  # Use original track index
             
             # Create filename
             start_frame = track_info['frame'][0] + frame_start
             end_frame = track_info['frame'][-1] + frame_start
-            track_filename = f"track_{track_idx:04d}_frames_{start_frame:06d}-{end_frame:06d}.mp4"
+            track_filename = f"track_{original_track_idx:04d}_frames_{start_frame:06d}-{end_frame:06d}.mp4"
             track_path = os.path.join(self.face_track_dir, track_filename)
             
             # Create temporary video file
@@ -412,7 +421,7 @@ class VisionProcesser():
             # Save metadata
             if self.save_track_metadata:
                 metadata = {
-                    'track_idx': track_idx,
+                    'track_idx': original_track_idx,  # Use original track index
                     'video_id': self.video_id,
                     'start_frame': int(start_frame),
                     'end_frame': int(end_frame),

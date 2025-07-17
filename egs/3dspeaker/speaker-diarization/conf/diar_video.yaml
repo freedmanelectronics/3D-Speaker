@@ -57,3 +57,4 @@ face_track_output_dir: face_tracks
 track_video_fps: 25
 include_audio_in_tracks: true
 save_track_metadata: true
+min_avg_score_threshold: 0.5  # Only save tracks with average ASD score above this threshold
