@@ -97,10 +97,20 @@ def main():
         embs_out_path = os.path.join(args.embs_out, '%s.pkl'%rec_id)
         # Out video path -> same directory as embs_out_path
         out_video_path = os.path.join(os.path.dirname(args.embs_out), '%s.mp4'%rec_id)
+        
+        # Face track directory
+        save_tracks = conf.get('save_face_tracks', False)
+        face_track_dir = None
+        if save_tracks:
+            face_track_base_dir = os.path.join(os.path.dirname(args.embs_out), 
+                                              conf.get('face_track_output_dir', 'face_tracks'))
+            face_track_dir = os.path.join(face_track_base_dir, rec_id)
+            os.makedirs(face_track_dir, exist_ok=True)
 
         if not os.path.isfile(embs_out_path):
             vprocesser = VisionProcesser(vpath, audio_path, rec_vad_time_list, embs_out_path, 
-                                        args.onnx_dir, conf, device, gpu_id, out_video_path)
+                                        args.onnx_dir, conf, device, gpu_id, out_video_path,
+                                        save_tracks=save_tracks, face_track_dir=face_track_dir)
             vprocesser.run()
         else:
             print("[WARNING]: Embeddings has been saved previously. Skip it.")

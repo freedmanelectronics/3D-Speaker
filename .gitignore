@@ -46,3 +46,5 @@ Makefile
 **/__pycache__/
 
 test_results/
+
+egs/3dspeaker/speaker-diarization/pretrained_models

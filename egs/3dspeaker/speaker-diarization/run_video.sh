@@ -9,10 +9,10 @@ set -e
 . ./path.sh || exit 1
 
 stage=2
-stop_stage=5
+stop_stage=7
 
 examples=examples
-exp=/home/jaesung/temp/kiran
+exp=/home/jaesung/temp/test
 conf_file=conf/diar_video.yaml
 onnx_dir=pretrained_models
 gpus="0"
@@ -20,7 +20,7 @@ nj=4
 
 . local/parse_options.sh || exit 1
 
-video_list=$examples/kiran.list
+video_list=$examples/vox_test.list
 raw_data_dir=$exp/raw
 visual_embs_dir=$exp/embs_video
 rttm_dir=$exp/rttm
@@ -92,7 +92,21 @@ duration=$SECONDS
 echo "$((duration / 60)) minutes and $((duration % 60)) seconds elapsed."
 
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
-  echo "$(basename $0) Stage6: Get the final metrics..."
+  echo "$(basename $0) Stage6: Map face tracks to speaker IDs..."
+  if [ -d "$exp/face_tracks" ]; then
+    python local/map_tracks_to_speakers.py \
+      --face_tracks_dir $exp/face_tracks \
+      --rttm_dir $rttm_dir \
+      --visual_embs_dir $visual_embs_dir \
+      --output_dir $exp/speaker_tracks
+    echo "Face tracks mapped to speakers and saved in $exp/speaker_tracks"
+  else
+    echo "Face tracks directory not found. Skipping track-to-speaker mapping."
+  fi
+fi
+
+if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
+  echo "$(basename $0) Stage7: Get the final metrics..."
   ref_rttm_list=$examples/vox_test_refrttm.list
   if [ -f $ref_rttm_list ]; then
     cat $ref_rttm_list | while read line;do cat $line;done > $exp/concat_ref_rttm

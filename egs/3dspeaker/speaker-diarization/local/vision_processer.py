@@ -20,6 +20,8 @@ import numpy as np
 from scipy.io import wavfile
 from scipy.interpolate import interp1d
 import os, time, torch, cv2, pickle, python_speech_features
+import json
+import subprocess
 
 import vision_tools.face_detection as face_detection
 import vision_tools.active_speaker_detection as active_speaker_detection
@@ -38,7 +40,9 @@ class VisionProcesser():
         conf, 
         device='cpu', 
         device_id=0, 
-        out_video_path=None
+        out_video_path=None,
+        save_tracks=False,
+        face_track_dir=None
         ):
         # read audio data and check the samplerate.
         fs, self.audio = wavfile.read(audio_file_path)
@@ -67,6 +71,9 @@ class VisionProcesser():
         self.audio_vad = audio_vad
         self.out_video_path = out_video_path
         self.out_feat_path = out_feat_path
+        self.save_tracks = save_tracks
+        self.face_track_dir = face_track_dir
+        self.audio_file_path = audio_file_path
 
         self.min_track = conf['min_track']
         self.num_failed_det = conf['num_failed_det']
@@ -74,6 +81,11 @@ class VisionProcesser():
         self.min_face_size = conf['min_face_size']
         self.face_det_stride = conf['face_det_stride']
         self.shot_stride = conf['shot_stride']
+        
+        # Face track saving configuration
+        self.track_video_fps = conf.get('track_video_fps', 25)
+        self.include_audio_in_tracks = conf.get('include_audio_in_tracks', True)
+        self.save_track_metadata = conf.get('save_track_metadata', True)
 
         if self.out_video_path is not None:
             # save the active face detection results video (for debugging).
@@ -81,6 +93,12 @@ class VisionProcesser():
 
         # record the time spent by each module.
         self.elapsed_time = {'faceTime':[], 'trackTime':[], 'cropTime':[],'asdTime':[], 'visTime':[], 'featTime':[]}
+        
+        # Store all tracks for later saving
+        if self.save_tracks:
+            self.all_tracks_data = []
+            if self.face_track_dir:
+                os.makedirs(self.face_track_dir, exist_ok=True)
 
     def run(self):
         frames, face_det_frames = [], []
@@ -114,6 +132,10 @@ class VisionProcesser():
 
         active_facial_embs = {'embeddings':self.active_facial_embs['feat'], 'times': self.active_facial_embs['frameI']*0.04}
         pickle.dump(active_facial_embs, open(self.out_feat_path, 'wb'))
+        
+        # Save face tracks if enabled
+        if self.save_tracks and self.face_track_dir:
+            self.save_face_tracks()
 
         # print elapsed time
         all_elapsed_time = 0
@@ -145,6 +167,20 @@ class VisionProcesser():
         self.active_facial_embs['frameI'] = np.append(self.active_facial_embs['frameI'], active_facial_embs['frameI'] + frame_st)
         self.active_facial_embs['feat'] = np.append(self.active_facial_embs['feat'], active_facial_embs['feat'], axis=0)
         featTime = time.time()
+        
+        # Store track data for saving
+        if self.save_tracks:
+            for idx, (track, score) in enumerate(zip(vidTracks, scores)):
+                track_data = {
+                    'track_info': track['track'],
+                    'proc_track': track['proc_track'],
+                    'video_frames': track['data'][0],  # Cropped face frames
+                    'audio': track['data'][1],         # Audio segment
+                    'scores': score,
+                    'frame_start': frame_st,
+                    'track_idx': idx
+                }
+                self.all_tracks_data.append(track_data)
 
         if self.out_video_path is not None:
             self.visualization(frames, vidTracks, scores)
@@ -314,3 +350,89 @@ class VisionProcesser():
                 cv2.rectangle(image, (int(face['bbox'][0]), int(face['bbox'][1])), (int(face['bbox'][2]), int(face['bbox'][3])),(0,clr,255-clr),10)
                 cv2.putText(image,'%s'%(txt), (int(face['bbox'][0]), int(face['bbox'][1])), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,clr,255-clr),5)
             self.v_out.write(image)
+    
+    def save_face_tracks(self):
+        """Save individual face tracks as MP4 files with audio"""
+        print(f"Saving {len(self.all_tracks_data)} face tracks to {self.face_track_dir}")
+        
+        track_metadata = []
+        
+        for track_idx, track_data in enumerate(self.all_tracks_data):
+            # Extract track information
+            track_info = track_data['track_info']
+            video_frames = track_data['video_frames']
+            audio_segment = track_data['audio']
+            scores = track_data['scores']
+            frame_start = track_data['frame_start']
+            
+            # Create filename
+            start_frame = track_info['frame'][0] + frame_start
+            end_frame = track_info['frame'][-1] + frame_start
+            track_filename = f"track_{track_idx:04d}_frames_{start_frame:06d}-{end_frame:06d}.mp4"
+            track_path = os.path.join(self.face_track_dir, track_filename)
+            
+            # Create temporary video file
+            temp_video_path = track_path.replace('.mp4', '_temp.mp4')
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            frame_height, frame_width = video_frames[0].shape[:2]
+            video_writer = cv2.VideoWriter(temp_video_path, fourcc, self.track_video_fps, 
+                                          (frame_width, frame_height))
+            
+            # Write frames with optional score overlay
+            for frame_idx, (frame, score_val) in enumerate(zip(video_frames, scores)):
+                frame_copy = frame.copy()
+                # Add score text overlay
+                cv2.putText(frame_copy, f'Score: {float(score_val):.2f}', 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                video_writer.write(frame_copy)
+            
+            video_writer.release()
+            
+            # Save audio and combine with video using ffmpeg
+            if self.include_audio_in_tracks and len(audio_segment) > 0:
+                # Save temporary audio file
+                temp_audio_path = track_path.replace('.mp4', '_temp.wav')
+                wavfile.write(temp_audio_path, 16000, audio_segment)
+                
+                # Combine video and audio using ffmpeg
+                cmd = [
+                    'ffmpeg', '-y', '-i', temp_video_path, '-i', temp_audio_path,
+                    '-c:v', 'libx264', '-c:a', 'aac', '-strict', 'experimental',
+                    '-shortest', track_path
+                ]
+                subprocess.run(cmd, capture_output=True, text=True)
+                
+                # Clean up temporary files
+                os.remove(temp_video_path)
+                os.remove(temp_audio_path)
+            else:
+                # Just rename the video file
+                os.rename(temp_video_path, track_path)
+            
+            # Save metadata
+            if self.save_track_metadata:
+                metadata = {
+                    'track_idx': track_idx,
+                    'video_id': self.video_id,
+                    'start_frame': int(start_frame),
+                    'end_frame': int(end_frame),
+                    'start_time': float(start_frame) / self.fps,
+                    'end_time': float(end_frame) / self.fps,
+                    'duration': float(end_frame - start_frame) / self.fps,
+                    'num_frames': len(video_frames),
+                    'avg_score': float(np.mean(scores)),
+                    'max_score': float(np.max(scores)),
+                    'min_score': float(np.min(scores)),
+                    'bbox_info': {
+                        'avg_width': float(np.mean(track_info['bbox'][:, 2] - track_info['bbox'][:, 0])),
+                        'avg_height': float(np.mean(track_info['bbox'][:, 3] - track_info['bbox'][:, 1]))
+                    }
+                }
+                track_metadata.append(metadata)
+        
+        # Save all metadata to a JSON file
+        if self.save_track_metadata and track_metadata:
+            metadata_path = os.path.join(self.face_track_dir, f"{self.video_id}_tracks_metadata.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(track_metadata, f, indent=2)
+            print(f"Track metadata saved to {metadata_path}")

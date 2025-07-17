@@ -50,3 +50,10 @@ cluster:
   args:
     audio_cluster: <audio_cluster>
     vision_cluster: <vision_cluster>
+
+# for face track saving
+save_face_tracks: true
+face_track_output_dir: face_tracks
+track_video_fps: 25
+include_audio_in_tracks: true
+save_track_metadata: true
