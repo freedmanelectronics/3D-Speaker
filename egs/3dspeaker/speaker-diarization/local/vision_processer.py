@@ -50,6 +50,7 @@ class VisionProcesser():
         # convert time interval to integer sampling point interval.
         audio_vad = [[int(i*16000), int(j*16000)] for (i, j) in audio_vad]
         self.video_id = os.path.basename(video_file_path).rsplit('.', 1)[0]
+        self.video_file_path = video_file_path  # Store full video path for gap filling
 
         # read video data
         self.cap = cv2.VideoCapture(video_file_path)
@@ -87,6 +88,9 @@ class VisionProcesser():
         self.include_audio_in_tracks = conf.get('include_audio_in_tracks', True)
         self.save_track_metadata = conf.get('save_track_metadata', True)
         self.min_avg_score_threshold = conf.get('min_avg_score_threshold', 0.5)
+        self.merge_tracks = conf.get('merge_tracks', True)
+        self.max_gap_frames = conf.get('max_gap_frames', 10)
+        self.show_scores_on_frames = conf.get('show_scores_on_frames', False)
 
         if self.out_video_path is not None:
             # save the active face detection results video (for debugging).
@@ -361,8 +365,9 @@ class VisionProcesser():
             if avg_score >= self.min_avg_score_threshold:
                 filtered_tracks.append(track_data)
         
-        print(f"Saving {len(filtered_tracks)} face tracks (out of {len(self.all_tracks_data)} total) with avg score >= {self.min_avg_score_threshold} to {self.face_track_dir}")
+        print(f"Filtered {len(filtered_tracks)} face tracks (out of {len(self.all_tracks_data)} total) with avg score >= {self.min_avg_score_threshold}")
         
+        # Save tracks without merging for now - merging will be done after speaker clustering
         track_metadata = []
         
         for track_idx, track_data in enumerate(filtered_tracks):
@@ -389,11 +394,14 @@ class VisionProcesser():
             
             # Write frames with optional score overlay
             for frame_idx, (frame, score_val) in enumerate(zip(video_frames, scores)):
-                frame_copy = frame.copy()
-                # Add score text overlay
-                cv2.putText(frame_copy, f'Score: {float(score_val):.2f}', 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                video_writer.write(frame_copy)
+                if self.show_scores_on_frames:
+                    frame_copy = frame.copy()
+                    # Add score text overlay
+                    cv2.putText(frame_copy, f'Score: {float(score_val):.2f}', 
+                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    video_writer.write(frame_copy)
+                else:
+                    video_writer.write(frame)
             
             video_writer.release()
             
@@ -435,7 +443,11 @@ class VisionProcesser():
                     'bbox_info': {
                         'avg_width': float(np.mean(track_info['bbox'][:, 2] - track_info['bbox'][:, 0])),
                         'avg_height': float(np.mean(track_info['bbox'][:, 3] - track_info['bbox'][:, 1]))
-                    }
+                    },
+                    'bboxes': track_info['bbox'].tolist(),  # Store all bounding boxes for interpolation
+                    'frames': track_info['frame'].tolist(),   # Store frame numbers
+                    'video_path': self.video_file_path,       # Store full video path for gap filling
+                    'audio_path': self.audio_file_path        # Store audio path
                 }
                 track_metadata.append(metadata)
         
