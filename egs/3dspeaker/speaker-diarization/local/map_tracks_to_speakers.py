@@ -15,6 +15,7 @@ import pickle
 import shutil
 import numpy as np
 from pathlib import Path
+import cv2
 
 parser = argparse.ArgumentParser(description='Map face tracks to speaker IDs after clustering')
 parser.add_argument('--face_tracks_dir', required=True, help='Base directory containing face tracks')
