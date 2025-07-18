@@ -8,19 +8,19 @@
 set -e
 . ./path.sh || exit 1
 
-stage=3
+stage=2
 stop_stage=7
 
 examples=examples
-exp=/home/jaesung/temp/kiran
+exp=results
 conf_file=conf/diar_video.yaml
 onnx_dir=pretrained_models
-gpus="0 1"
+gpus="0"
 nj=4
 
 . local/parse_options.sh || exit 1
 
-video_list=$examples/kiran.list
+video_list=$examples/kiran_one.list
 raw_data_dir=$exp/raw
 visual_embs_dir=$exp/embs_video
 rttm_dir=$exp/rttm
@@ -97,23 +97,22 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
     # Read merge settings from config
     merge_tracks=$(grep "merge_tracks:" $conf_file | awk '{print $2}')
     max_gap_frames=$(grep "max_gap_frames:" $conf_file | awk '{print $2}')
-    fill_gaps=$(grep "fill_gaps_in_merge:" $conf_file | awk '{print $2}')
     
     merge_args=""
     if [ "$merge_tracks" = "true" ]; then
       merge_args="--merge_tracks --max_gap_frames $max_gap_frames"
-      
-      # Add gap filling arguments if enabled
-      if [ "$fill_gaps" = "true" ]; then
-        merge_args="$merge_args --fill_gaps --raw_video_dir $raw_data_dir"
-      fi
     fi
+    
+    # Get the audio file path for the current video
+    audio_file=$raw_data_dir/${video_id}.wav
     
     python local/map_tracks_to_speakers.py \
       --face_tracks_dir $exp/face_tracks \
       --rttm_dir $rttm_dir \
       --visual_embs_dir $visual_embs_dir \
       --output_dir $exp/speaker_tracks \
+      --audio_file $audio_file \
+      --video_fps 25 \
       $merge_args
     echo "Face tracks mapped to speakers and saved in $exp/speaker_tracks"
   else

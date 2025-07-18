@@ -24,8 +24,8 @@ parser.add_argument('--visual_embs_dir', required=True, help='Directory containi
 parser.add_argument('--output_dir', required=True, help='Output directory for renamed tracks')
 parser.add_argument('--merge_tracks', action='store_true', help='Merge tracks from same speaker')
 parser.add_argument('--max_gap_frames', type=int, default=10, help='Maximum gap in frames to merge tracks')
-parser.add_argument('--fill_gaps', action='store_true', help='Fill gaps between tracks with interpolated faces')
-parser.add_argument('--raw_video_dir', default=None, help='Directory containing raw video files for gap filling')
+parser.add_argument('--audio_file', help='Path to original audio file for continuous audio in merged tracks')
+parser.add_argument('--video_fps', type=float, default=25.0, help='Video FPS for time calculations')
 
 def parse_rttm(rttm_file):
     """Parse RTTM file to get speaker segments"""
@@ -78,7 +78,7 @@ def find_speaker_for_track(track_metadata, speaker_segments):
     
     return best_speaker if best_overlap > 0.5 else -1  # Require at least 50% overlap
 
-def merge_speaker_tracks(track_mappings, face_tracks_dir, video_id, output_dir, merged_tracks_dir, max_gap_frames=10):
+def merge_speaker_tracks(track_mappings, face_tracks_dir, video_id, output_dir, merged_tracks_dir, max_gap_frames=10, audio_file_path=None, video_fps=25):
     """Merge tracks from the same speaker that are close together"""
     import cv2
     from scipy.io import wavfile
@@ -167,24 +167,61 @@ def merge_speaker_tracks(track_mappings, face_tracks_dir, video_id, output_dir, 
                 new_filename = f"speaker_{speaker_id:02d}_segment_{group_idx:03d}_merged_{len(group)}_tracks.mp4"
                 new_path = os.path.join(merged_tracks_dir, new_filename)
                 
-                # Create list of video files to concatenate
-                concat_list_path = os.path.join(merged_tracks_dir, f"concat_list_{speaker_id}_{group_idx}.txt")
-                with open(concat_list_path, 'w') as f:
-                    for track in group:
-                        track_path = os.path.join(face_tracks_dir, video_id, track['original_filename'])
-                        f.write(f"file '{track_path}'\n")
-                
-                # Use ffmpeg to concatenate videos
-                cmd = [
-                    'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-                    '-i', concat_list_path,
-                    '-c:v', 'libx264', '-c:a', 'aac',
-                    new_path
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                
-                # Clean up concat list
-                os.remove(concat_list_path)
+                if audio_file_path:
+                    # Extract continuous audio from original file
+                    start_time = float(start_frame) / video_fps
+                    end_time = float(end_frame) / video_fps
+                    
+                    # First concatenate video files without audio
+                    temp_video_path = new_path.replace('.mp4', '_temp_video.mp4')
+                    concat_list_path = os.path.join(merged_tracks_dir, f"concat_list_{speaker_id}_{group_idx}.txt")
+                    with open(concat_list_path, 'w') as f:
+                        for track in group:
+                            track_path = os.path.join(face_tracks_dir, video_id, track['original_filename'])
+                            f.write(f"file '{track_path}'\n")
+                    
+                    # Concatenate videos without re-encoding
+                    cmd = [
+                        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                        '-i', concat_list_path,
+                        '-c', 'copy',  # Copy without re-encoding
+                        temp_video_path
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    os.remove(concat_list_path)
+                    
+                    if result.returncode == 0:
+                        # Extract continuous audio from original file and merge with video
+                        cmd = [
+                            'ffmpeg', '-y',
+                            '-i', temp_video_path,  # Input video
+                            '-i', audio_file_path,  # Input audio
+                            '-ss', str(start_time),  # Start time
+                            '-t', str(end_time - start_time),  # Duration
+                            '-c:v', 'copy',  # Copy video
+                            '-c:a', 'aac',   # Encode audio
+                            '-map', '0:v:0',  # Use video from first input
+                            '-map', '1:a:0',  # Use audio from second input
+                            new_path
+                        ]
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        os.remove(temp_video_path)
+                else:
+                    # Fallback to original concatenation method
+                    concat_list_path = os.path.join(merged_tracks_dir, f"concat_list_{speaker_id}_{group_idx}.txt")
+                    with open(concat_list_path, 'w') as f:
+                        for track in group:
+                            track_path = os.path.join(face_tracks_dir, video_id, track['original_filename'])
+                            f.write(f"file '{track_path}'\n")
+                    
+                    cmd = [
+                        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                        '-i', concat_list_path,
+                        '-c:v', 'libx264', '-c:a', 'aac',
+                        new_path
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    os.remove(concat_list_path)
                 
                 if result.returncode == 0:
                     merged_mappings.append({
@@ -198,272 +235,6 @@ def merge_speaker_tracks(track_mappings, face_tracks_dir, video_id, output_dir, 
                     })
                 else:
                     print(f"    Error merging tracks: {result.stderr}")
-    
-    return merged_mappings
-
-def interpolate_bboxes(bbox1, bbox2, num_frames):
-    """Linearly interpolate bounding boxes between two tracks"""
-    if num_frames <= 0:
-        return []
-    
-    interpolated = []
-    for i in range(num_frames):
-        alpha = i / (num_frames - 1) if num_frames > 1 else 0
-        bbox = []
-        for j in range(4):  # x1, y1, x2, y2
-            bbox.append(bbox1[j] + alpha * (bbox2[j] - bbox1[j]))
-        interpolated.append(bbox)
-    
-    return interpolated
-
-def extract_face_from_video(video_path, frame_num, bbox, target_size=(224, 224)):
-    """Extract and crop face from video at specific frame using bbox"""
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-    ret, frame = cap.read()
-    cap.release()
-    
-    if not ret:
-        return None
-    
-    # Crop face using bbox
-    x1, y1, x2, y2 = [int(coord) for coord in bbox]
-    x1 = max(0, x1)
-    y1 = max(0, y1)
-    x2 = min(frame.shape[1], x2)
-    y2 = min(frame.shape[0], y2)
-    
-    face = frame[y1:y2, x1:x2]
-    if face.size == 0:
-        return None
-    
-    # Resize to target size
-    face = cv2.resize(face, target_size)
-    return face
-
-def merge_speaker_tracks_with_gap_filling(track_mappings, face_tracks_dir, video_id, output_dir, 
-                                         merged_tracks_dir, max_gap_frames=10, fill_gaps=False,
-                                         raw_video_dir=None):
-    """Merge tracks from the same speaker with optional gap filling"""
-    import cv2
-    from scipy.io import wavfile
-    import subprocess
-    
-    # Group tracks by speaker
-    speaker_tracks = {}
-    for mapping in track_mappings:
-        speaker_id = mapping['speaker_id']
-        if speaker_id not in speaker_tracks:
-            speaker_tracks[speaker_id] = []
-        speaker_tracks[speaker_id].append(mapping)
-    
-    merged_mappings = []
-    
-    # Load track metadata if gap filling is enabled
-    track_metadata = {}
-    if fill_gaps:
-        metadata_file = os.path.join(face_tracks_dir, video_id, f"{video_id}_tracks_metadata.json")
-        if os.path.exists(metadata_file):
-            with open(metadata_file, 'r') as f:
-                metadata_list = json.load(f)
-                for meta in metadata_list:
-                    track_metadata[meta['track_idx']] = meta
-    
-    for speaker_id, tracks in speaker_tracks.items():
-        # Sort tracks by start time
-        tracks.sort(key=lambda x: x['start_time'])
-        
-        # Find groups of tracks to merge
-        track_groups = []
-        current_group = [tracks[0]]
-        
-        for i in range(1, len(tracks)):
-            # Calculate gap between current track and previous track
-            prev_track = tracks[i-1]
-            curr_track = tracks[i]
-            
-            # Extract frame numbers from filenames
-            prev_frames = prev_track['original_filename'].split('frames_')[1].split('.mp4')[0]
-            prev_end_frame = int(prev_frames.split('-')[1])
-            
-            curr_frames = curr_track['original_filename'].split('frames_')[1].split('.mp4')[0]
-            curr_start_frame = int(curr_frames.split('-')[0])
-            
-            gap_frames = curr_start_frame - prev_end_frame
-            
-            if gap_frames <= max_gap_frames:
-                # Add to current group
-                current_group.append(curr_track)
-            else:
-                # Start new group
-                track_groups.append(current_group)
-                current_group = [curr_track]
-        
-        # Add the last group
-        track_groups.append(current_group)
-        
-        # Merge each group
-        for group_idx, group in enumerate(track_groups):
-            if len(group) == 1 and not fill_gaps:
-                # Single track without gap filling, just copy as before
-                mapping = group[0]
-                original_path = os.path.join(face_tracks_dir, video_id, mapping['original_filename'])
-                new_filename = f"speaker_{speaker_id:02d}_segment_{group_idx:03d}.mp4"
-                new_path = os.path.join(merged_tracks_dir, new_filename)
-                
-                if os.path.exists(original_path):
-                    shutil.copy2(original_path, new_path)
-                    merged_mappings.append({
-                        'speaker_id': speaker_id,
-                        'segment_idx': group_idx,
-                        'original_tracks': [mapping['track_idx']],
-                        'filename': new_filename,
-                        'start_time': mapping['start_time'],
-                        'end_time': mapping['end_time'],
-                        'avg_score': mapping['avg_score']
-                    })
-            else:
-                # Multiple tracks to merge or gap filling enabled
-                if fill_gaps and raw_video_dir:
-                    print(f"  Merging {len(group)} tracks for speaker {speaker_id}, segment {group_idx} with gap filling")
-                    
-                    # Create temporary directory for segments
-                    temp_dir = os.path.join(merged_tracks_dir, f"temp_{speaker_id}_{group_idx}")
-                    os.makedirs(temp_dir, exist_ok=True)
-                    
-                    # Create list of all segments (tracks + gaps)
-                    all_segments = []
-                    segment_idx = 0
-                    
-                    for j, track in enumerate(group):
-                        # Add the track video
-                        track_path = os.path.join(face_tracks_dir, video_id, track['original_filename'])
-                        segment_filename = f"segment_{segment_idx:04d}.mp4"
-                        segment_path = os.path.join(temp_dir, segment_filename)
-                        shutil.copy2(track_path, segment_path)
-                        all_segments.append(segment_path)
-                        segment_idx += 1
-                        
-                        # If not the last track, create gap video
-                        if j < len(group) - 1:
-                            next_track = group[j + 1]
-                            
-                            # Get metadata for current and next tracks
-                            curr_meta = track_metadata.get(track['track_idx'])
-                            next_meta = track_metadata.get(next_track['track_idx'])
-                            
-                            if curr_meta and next_meta and 'bboxes' in curr_meta and 'bboxes' in next_meta:
-                                # Calculate gap frames
-                                curr_end_frame = curr_meta['end_frame']
-                                next_start_frame = next_meta['start_frame']
-                                gap_frame_count = next_start_frame - curr_end_frame - 1
-                                
-                                if gap_frame_count > 0:
-                                    # Get last bbox of current track and first bbox of next track
-                                    last_bbox = curr_meta['bboxes'][-1]
-                                    first_bbox = next_meta['bboxes'][0]
-                                    
-                                    # Interpolate bboxes for gap frames
-                                    interpolated_bboxes = interpolate_bboxes(last_bbox, first_bbox, gap_frame_count)
-                                    
-                                    # Get video path
-                                    video_path = curr_meta.get('video_path')
-                                    if not video_path and raw_video_dir:
-                                        video_path = os.path.join(raw_video_dir, f"{video_id}.mp4")
-                                    
-                                    # Extract faces for gap frames
-                                    gap_segment_filename = f"segment_{segment_idx:04d}.mp4"
-                                    gap_segment_path = os.path.join(temp_dir, gap_segment_filename)
-                                    
-                                    # Create video writer for gap segment
-                                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                                    gap_writer = cv2.VideoWriter(gap_segment_path, fourcc, 25, (224, 224))
-                                    
-                                    for k, bbox in enumerate(interpolated_bboxes):
-                                        frame_num = curr_end_frame + k + 1
-                                        face = extract_face_from_video(video_path, frame_num, bbox)
-                                        if face is not None:
-                                            gap_writer.write(face)
-                                    
-                                    gap_writer.release()
-                                    
-                                    if os.path.exists(gap_segment_path) and os.path.getsize(gap_segment_path) > 0:
-                                        all_segments.append(gap_segment_path)
-                                        segment_idx += 1
-                    
-                    # Create concat list
-                    concat_list_path = os.path.join(temp_dir, "concat_list.txt")
-                    with open(concat_list_path, 'w') as f:
-                        for seg_path in all_segments:
-                            f.write(f"file '{seg_path}'\n")
-                    
-                    # Merge all segments
-                    new_filename = f"speaker_{speaker_id:02d}_segment_{group_idx:03d}_merged_{len(group)}_tracks_gap_filled.mp4"
-                    new_path = os.path.join(merged_tracks_dir, new_filename)
-                    
-                    cmd = [
-                        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-                        '-i', concat_list_path,
-                        '-c:v', 'libx264', '-c:a', 'aac',
-                        new_path
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    
-                    # Clean up temporary files
-                    shutil.rmtree(temp_dir)
-                    
-                    if result.returncode == 0:
-                        merged_mappings.append({
-                            'speaker_id': speaker_id,
-                            'segment_idx': group_idx,
-                            'original_tracks': [t['track_idx'] for t in group],
-                            'filename': new_filename,
-                            'start_time': group[0]['start_time'],
-                            'end_time': group[-1]['end_time'],
-                            'avg_score': float(np.mean([t['avg_score'] for t in group])),
-                            'gap_filled': True
-                        })
-                    else:
-                        print(f"    Error merging tracks with gap filling: {result.stderr}")
-                else:
-                    # Standard merging without gap filling (original implementation)
-                    print(f"  Merging {len(group)} tracks for speaker {speaker_id}, segment {group_idx}")
-                    
-                    # Create output filename
-                    new_filename = f"speaker_{speaker_id:02d}_segment_{group_idx:03d}_merged_{len(group)}_tracks.mp4"
-                    new_path = os.path.join(merged_tracks_dir, new_filename)
-                    
-                    # Create list of video files to concatenate
-                    concat_list_path = os.path.join(merged_tracks_dir, f"concat_list_{speaker_id}_{group_idx}.txt")
-                    with open(concat_list_path, 'w') as f:
-                        for track in group:
-                            track_path = os.path.join(face_tracks_dir, video_id, track['original_filename'])
-                            f.write(f"file '{track_path}'\n")
-                    
-                    # Use ffmpeg to concatenate videos
-                    cmd = [
-                        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-                        '-i', concat_list_path,
-                        '-c:v', 'libx264', '-c:a', 'aac',
-                        new_path
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    
-                    # Clean up concat list
-                    os.remove(concat_list_path)
-                    
-                    if result.returncode == 0:
-                        merged_mappings.append({
-                            'speaker_id': speaker_id,
-                            'segment_idx': group_idx,
-                            'original_tracks': [t['track_idx'] for t in group],
-                            'filename': new_filename,
-                            'start_time': group[0]['start_time'],
-                            'end_time': group[-1]['end_time'],
-                            'avg_score': float(np.mean([t['avg_score'] for t in group]))
-                        })
-                    else:
-                        print(f"    Error merging tracks: {result.stderr}")
     
     return merged_mappings
 
@@ -538,28 +309,17 @@ def main():
         
         # Merge tracks if requested
         if args.merge_tracks and track_to_speaker_mapping:
-            if args.fill_gaps:
-                print(f"  Merging tracks with max gap of {args.max_gap_frames} frames and gap filling...")
-                merged_mappings = merge_speaker_tracks_with_gap_filling(
-                    track_to_speaker_mapping, 
-                    args.face_tracks_dir, 
-                    video_id, 
-                    video_output_dir,
-                    merged_tracks_dir,
-                    args.max_gap_frames,
-                    fill_gaps=True,
-                    raw_video_dir=args.raw_video_dir
-                )
-            else:
-                print(f"  Merging tracks with max gap of {args.max_gap_frames} frames...")
-                merged_mappings = merge_speaker_tracks(
-                    track_to_speaker_mapping, 
-                    args.face_tracks_dir, 
-                    video_id, 
-                    video_output_dir,
-                    merged_tracks_dir,
-                    args.max_gap_frames
-                )
+            print(f"  Merging tracks with max gap of {args.max_gap_frames} frames...")
+            merged_mappings = merge_speaker_tracks(
+                track_to_speaker_mapping, 
+                args.face_tracks_dir, 
+                video_id, 
+                video_output_dir,
+                merged_tracks_dir,
+                args.max_gap_frames,
+                args.audio_file,
+                args.video_fps
+            )
             
             # Save merged mapping
             merged_mapping_file = os.path.join(video_output_dir, f"{video_id}_merged_track_mapping.json")

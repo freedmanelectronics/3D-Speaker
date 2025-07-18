@@ -61,5 +61,5 @@ min_avg_score_threshold: 0.5  # Only save tracks with average ASD score above th
 merge_tracks: true  # Merge tracks from same speaker that are close together
 max_gap_frames: 10  # Maximum gap in frames to merge tracks
 show_scores_on_frames: false  # Show ASD scores on video frames
-fill_gaps_in_merge: true  # Fill gaps between merged tracks with interpolated face crops
-disable_quality_check_for_gaps: true  # Skip face quality assessment for gap frames
+disable_face_quality_check: false  # Disable face quality evaluation to speed up processing
+min_iou: 0.2

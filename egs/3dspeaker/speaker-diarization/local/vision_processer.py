@@ -50,7 +50,6 @@ class VisionProcesser():
         # convert time interval to integer sampling point interval.
         audio_vad = [[int(i*16000), int(j*16000)] for (i, j) in audio_vad]
         self.video_id = os.path.basename(video_file_path).rsplit('.', 1)[0]
-        self.video_file_path = video_file_path  # Store full video path for gap filling
 
         # read video data
         self.cap = cv2.VideoCapture(video_file_path)
@@ -82,6 +81,7 @@ class VisionProcesser():
         self.min_face_size = conf['min_face_size']
         self.face_det_stride = conf['face_det_stride']
         self.shot_stride = conf['shot_stride']
+        self.min_iou = conf['min_iou']
         
         # Face track saving configuration
         self.track_video_fps = conf.get('track_video_fps', 25)
@@ -91,10 +91,13 @@ class VisionProcesser():
         self.merge_tracks = conf.get('merge_tracks', True)
         self.max_gap_frames = conf.get('max_gap_frames', 10)
         self.show_scores_on_frames = conf.get('show_scores_on_frames', False)
+        self.disable_face_quality_check = conf.get('disable_face_quality_check', False)
 
         if self.out_video_path is not None:
             # save the active face detection results video (for debugging).
-            self.v_out = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*'mp4v'), 25, (int(w), int(h)))
+            # Create a temporary video file without audio
+            self.temp_video_path = out_video_path.rsplit('.', 1)[0] + '_temp.mp4'
+            self.v_out = cv2.VideoWriter(self.temp_video_path, cv2.VideoWriter_fourcc(*'mp4v'), 25, (int(w), int(h)))
 
         # record the time spent by each module.
         self.elapsed_time = {'faceTime':[], 'trackTime':[], 'cropTime':[],'asdTime':[], 'visTime':[], 'featTime':[]}
@@ -134,6 +137,27 @@ class VisionProcesser():
         self.cap.release()
         if self.out_video_path is not None:
             self.v_out.release()
+            
+            # Merge video with audio using ffmpeg
+            print(f'Merging audio into output video: {self.out_video_path}')
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', self.temp_video_path,  # Input video
+                '-i', self.audio_file_path,  # Input audio
+                '-c:v', 'copy',  # Copy video codec
+                '-c:a', 'aac',   # Audio codec
+                '-shortest',     # Match duration to shortest stream
+                self.out_video_path
+            ]
+            
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                # Remove temporary video file
+                os.remove(self.temp_video_path)
+                print(f'Successfully created video with audio: {self.out_video_path}')
+            except subprocess.CalledProcessError as e:
+                print(f'Error merging audio: {e}')
+                print(f'Keeping temporary video without audio: {self.temp_video_path}')
 
         active_facial_embs = {'embeddings':self.active_facial_embs['feat'], 'times': self.active_facial_embs['frameI']*0.04}
         pickle.dump(active_facial_embs, open(self.out_feat_path, 'wb'))
@@ -240,7 +264,7 @@ class VisionProcesser():
                     elif face['frame'] - track[-1]['frame'] <= self.num_failed_det:  # the face does not interrupt for 'num_failed_det' frame.
                         iou = self.bb_intersection_over_union(face['bbox'], track[-1]['bbox'])
                         # minimum IOU between consecutive face.
-                        if iou > 0.5:
+                        if iou > self.min_iou:
                             track.append(face)
                             frame_faces.remove(face)
                             break
@@ -330,9 +354,10 @@ class VisionProcesser():
             # process frames containing only one active face.
             if active_face_num == 1:
                 # quality assessment
-                face_quality_score = self.face_quality_evaluator(active_face)
-                if face_quality_score < 0.7:
-                    continue
+                if not self.disable_face_quality_check:
+                    face_quality_score = self.face_quality_evaluator(active_face)
+                    if face_quality_score < 0.7:
+                        continue
                 feature = self.face_embs_extractor(active_face)
                 active_facial_embs['frameI'] = np.append(active_facial_embs['frameI'], fidx)
                 active_facial_embs['feat'] = np.append(active_facial_embs['feat'], feature, axis=0)
@@ -443,11 +468,7 @@ class VisionProcesser():
                     'bbox_info': {
                         'avg_width': float(np.mean(track_info['bbox'][:, 2] - track_info['bbox'][:, 0])),
                         'avg_height': float(np.mean(track_info['bbox'][:, 3] - track_info['bbox'][:, 1]))
-                    },
-                    'bboxes': track_info['bbox'].tolist(),  # Store all bounding boxes for interpolation
-                    'frames': track_info['frame'].tolist(),   # Store frame numbers
-                    'video_path': self.video_file_path,       # Store full video path for gap filling
-                    'audio_path': self.audio_file_path        # Store audio path
+                    }
                 }
                 track_metadata.append(metadata)
         
