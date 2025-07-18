@@ -14,6 +14,7 @@
 <a href=""><img src="https://img.shields.io/badge/Pytorch->=1.10-blue"></a>
     
 </div>
+
 # 3D-speaker
 
 This is the modified version of 3D-speaker repository. 
@@ -28,6 +29,11 @@ bash run_video.sh
 ```
 
 - **Please specify the correct parameters in run_video.sh**
+
+## What have been modified
+- AV-diairzation pipeline now produces the json files which contains the metadata including start_time, end_time, bboxes, speaker identities per each face track and also the video face tracks only with the active speakers
+- The original version doesn't use the shot detection and just ran the face tracking every 50 frames, but I integrated the [scenedetect](https://www.scenedetect.com/) library.
+- The pipeline produces the visualized output video with the audio.
 
 ## Benchmark
 The EER results on VoxCeleb, CNCeleb and 3D-Speaker datasets for fully-supervised speaker verification.

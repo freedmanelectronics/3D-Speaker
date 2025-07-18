@@ -100,12 +100,14 @@ class VisionProcesser():
         self.min_avg_score_threshold = conf.get('min_avg_score_threshold', 0.5)
         self.show_scores_on_frames = conf.get('show_scores_on_frames', False)
         self.disable_face_quality_check = conf.get('disable_face_quality_check', False)
+        self.asd_audio_batch_size = conf.get('asd_audio_batch_size', 500)  # Batch size for ASD to prevent GPU overflow
 
         if self.out_video_path is not None:
             # save the active face detection results video (for debugging).
             # Create a temporary video file without audio
             self.temp_video_path = out_video_path.rsplit('.', 1)[0] + '_temp.mp4'
-            self.v_out = cv2.VideoWriter(self.temp_video_path, cv2.VideoWriter_fourcc(*'mp4v'), 25, (int(w), int(h)))
+            # Use the original video's fps instead of fixed 25fps
+            self.v_out = cv2.VideoWriter(self.temp_video_path, cv2.VideoWriter_fourcc(*'mp4v'), self.track_video_fps , (int(w), int(h)))
 
         # record the time spent by each module.
         self.elapsed_time = {'faceTime':[], 'trackTime':[], 'cropTime':[],'asdTime':[], 'visTime':[], 'featTime':[]}
@@ -212,13 +214,18 @@ class VisionProcesser():
             
             # Merge video with audio using ffmpeg
             print(f'Merging audio into output video: {self.out_video_path}')
+            # Use video filter to ensure proper frame rate and sync
             cmd = [
                 'ffmpeg', '-y',
                 '-i', self.temp_video_path,  # Input video
                 '-i', self.audio_file_path,  # Input audio
-                '-c:v', 'copy',  # Copy video codec
+                '-c:v', 'libx264',  # Re-encode video to ensure proper timestamps
+                '-r', str(self.fps),  # Set output frame rate to match original
                 '-c:a', 'aac',   # Audio codec
+                '-ar', '16000',  # Match audio sample rate
+                '-ac', '1',      # Mono audio
                 '-shortest',     # Match duration to shortest stream
+                '-vsync', 'vfr',  # Variable frame rate to maintain sync
                 self.out_video_path
             ]
             
@@ -394,9 +401,42 @@ class VisionProcesser():
             length = min((audio_feature.shape[0] - audio_feature.shape[0] % 4) / 100, video_feature.shape[0] / 25)
             audio_feature = audio_feature[:int(round(length * 100)),:]
             video_feature = video_feature[:int(round(length * 25)),:,:]
-            audio_feature = np.expand_dims(audio_feature, axis=0).astype(np.float32)
-            video_feature = np.expand_dims(video_feature, axis=0).astype(np.float32)
-            score = self.speaker_detector(audio_feature, video_feature)
+            
+            # Check if we need to process in batches
+            audio_frames = audio_feature.shape[0]
+            if audio_frames > self.asd_audio_batch_size:
+                # Process in batches
+                batch_scores = []
+                num_batches = (audio_frames + self.asd_audio_batch_size - 1) // self.asd_audio_batch_size
+                
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * self.asd_audio_batch_size
+                    end_idx = min((batch_idx + 1) * self.asd_audio_batch_size, audio_frames)
+                    
+                    # Calculate corresponding video indices (audio:video ratio is 100:25 or 4:1)
+                    video_start_idx = start_idx // 4
+                    video_end_idx = end_idx // 4
+                    
+                    # Extract batch features
+                    audio_batch = audio_feature[start_idx:end_idx, :]
+                    video_batch = video_feature[video_start_idx:video_end_idx, :, :]
+                    
+                    # Prepare batch for model
+                    audio_batch = np.expand_dims(audio_batch, axis=0).astype(np.float32)
+                    video_batch = np.expand_dims(video_batch, axis=0).astype(np.float32)
+                    
+                    # Get scores for this batch
+                    batch_score = self.speaker_detector(audio_batch, video_batch)
+                    batch_scores.append(batch_score)
+                
+                # Concatenate all batch scores
+                score = np.concatenate(batch_scores, axis=1)
+            else:
+                # Process normally if within batch size
+                audio_feature = np.expand_dims(audio_feature, axis=0).astype(np.float32)
+                video_feature = np.expand_dims(video_feature, axis=0).astype(np.float32)
+                score = self.speaker_detector(audio_feature, video_feature)
+            
             all_score = np.round(score, 1).astype(float)
             all_scores.append(all_score)	
         return all_scores

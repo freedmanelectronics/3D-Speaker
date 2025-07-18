@@ -8,7 +8,7 @@
 set -e
 . ./path.sh || exit 1
 
-stage=2
+stage=4
 stop_stage=7
 
 examples=examples
@@ -16,7 +16,7 @@ exp=results/kiran
 conf_file=conf/diar_video.yaml
 onnx_dir=pretrained_models
 gpus="0 1 2 3"
-nj=8
+nj=4
 
 . local/parse_options.sh || exit 1
 

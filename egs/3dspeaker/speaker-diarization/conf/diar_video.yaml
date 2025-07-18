@@ -64,4 +64,4 @@ save_track_metadata: true
 min_avg_score_threshold: 0.5  # Only save tracks with average ASD score above this threshold
 show_scores_on_frames: false  # Show ASD scores on video frames
 disable_face_quality_check: false  # Disable face quality evaluation to speed up processing
-min_iou: 0.2
+min_iou: 0.3
