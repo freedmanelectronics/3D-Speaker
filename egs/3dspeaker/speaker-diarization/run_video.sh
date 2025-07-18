@@ -15,8 +15,8 @@ examples=examples
 exp=results/kiran
 conf_file=conf/diar_video.yaml
 onnx_dir=pretrained_models
-gpus="0 1 2 3"
-nj=4
+gpus="0 1 2 3 4 5"
+nj=6
 
 . local/parse_options.sh || exit 1
 

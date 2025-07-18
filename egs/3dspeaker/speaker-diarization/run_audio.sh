@@ -13,7 +13,7 @@ stop_stage=7
 
 conf_file=conf/diar.yaml
 gpus="0 1 2 3"
-nj=4
+nj=8
 include_overlap=false
 hf_access_token=
 

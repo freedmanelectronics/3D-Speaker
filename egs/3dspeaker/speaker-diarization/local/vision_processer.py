@@ -100,14 +100,14 @@ class VisionProcesser():
         self.min_avg_score_threshold = conf.get('min_avg_score_threshold', 0.5)
         self.show_scores_on_frames = conf.get('show_scores_on_frames', False)
         self.disable_face_quality_check = conf.get('disable_face_quality_check', False)
-        self.asd_audio_batch_size = conf.get('asd_audio_batch_size', 500)  # Batch size for ASD to prevent GPU overflow
+        self.asd_audio_batch_size = conf.get('asd_audio_batch_size', 400)  # Batch size for ASD to prevent GPU overflow
 
         if self.out_video_path is not None:
             # save the active face detection results video (for debugging).
             # Create a temporary video file without audio
             self.temp_video_path = out_video_path.rsplit('.', 1)[0] + '_temp.mp4'
-            # Use the original video's fps instead of fixed 25fps
-            self.v_out = cv2.VideoWriter(self.temp_video_path, cv2.VideoWriter_fourcc(*'mp4v'), self.track_video_fps , (int(w), int(h)))
+            # Use fixed 25fps for output video
+            self.v_out = cv2.VideoWriter(self.temp_video_path, cv2.VideoWriter_fourcc(*'mp4v'), 25, (int(w), int(h)))
 
         # record the time spent by each module.
         self.elapsed_time = {'faceTime':[], 'trackTime':[], 'cropTime':[],'asdTime':[], 'visTime':[], 'featTime':[]}
@@ -171,6 +171,9 @@ class VisionProcesser():
         print(f"Detecting scenes in video {self.video_id}...")
         scenes = self.detect_scenes(self.video_file_path)
         
+        # Store face detection results for VAD segments
+        self.vad_face_results = {}  # frame_idx -> face detection results
+        
         # Process each VAD segment with scene boundaries
         for [audio_sample_st, audio_sample_ed] in self.audio_vad:
             # frame_st and frame_ed are the starting and ending frames of current interval.
@@ -207,25 +210,51 @@ class VisionProcesser():
                         
                         # Process the scene segment
                         self.process_one_shot(frames, face_det_frames, audio, overlap_start)
+        
+        # Now write all frames to output video
+        if self.out_video_path is not None:
+            # Reset video capture to beginning
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            
+            # Process all frames
+            frame_idx = 0
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
+                    break
+                
+                # Check if we have face detection results for this frame
+                if frame_idx in self.vad_face_results:
+                    # Draw face detection results
+                    for face_info in self.vad_face_results[frame_idx]:
+                        self.draw_face_on_frame(frame, face_info)
+                
+                # Write frame (with or without face detection)
+                self.v_out.write(frame)
+                frame_idx += 1
+            
+            self.v_out.release()
 
         self.cap.release()
+        
         if self.out_video_path is not None:
-            self.v_out.release()
-            
             # Merge video with audio using ffmpeg
             print(f'Merging audio into output video: {self.out_video_path}')
             # Use video filter to ensure proper frame rate and sync
+            # Calculate expected video duration based on audio duration
+            audio_duration = len(self.audio) / 16000.0  # Audio is 16kHz
+            
             cmd = [
                 'ffmpeg', '-y',
                 '-i', self.temp_video_path,  # Input video
                 '-i', self.audio_file_path,  # Input audio
                 '-c:v', 'libx264',  # Re-encode video to ensure proper timestamps
-                '-r', str(self.fps),  # Set output frame rate to match original
+                '-r', '25',  # Set output frame rate to 25fps
                 '-c:a', 'aac',   # Audio codec
                 '-ar', '16000',  # Match audio sample rate
                 '-ac', '1',      # Mono audio
-                '-shortest',     # Match duration to shortest stream
-                '-vsync', 'vfr',  # Variable frame rate to maintain sync
+                '-t', str(audio_duration),  # Set duration to match audio
+                '-vsync', 'cfr',  # Constant frame rate for better sync
                 self.out_video_path
             ]
             
@@ -291,7 +320,7 @@ class VisionProcesser():
                 self.all_tracks_data.append(track_data)
 
         if self.out_video_path is not None:
-            self.visualization(frames, vidTracks, scores)
+            self.visualization(frames, vidTracks, scores, frame_st)
         visTime = time.time()
 
         self.elapsed_time['faceTime'].append(faceTime-curTime)
@@ -430,7 +459,7 @@ class VisionProcesser():
                     batch_scores.append(batch_score)
                 
                 # Concatenate all batch scores
-                score = np.concatenate(batch_scores, axis=1)
+                score = np.concatenate(batch_scores, axis=0)
             else:
                 # Process normally if within batch size
                 audio_feature = np.expand_dims(audio_feature, axis=0).astype(np.float32)
@@ -475,7 +504,7 @@ class VisionProcesser():
                 active_facial_embs['feat'] = np.append(active_facial_embs['feat'], feature, axis=0)
         return active_facial_embs
 
-    def visualization(self, frames, tracks, scores):
+    def visualization(self, frames, tracks, scores, frame_offset=0):
         faces = [[] for i in range(len(frames))]
         for tidx, track in enumerate(tracks):
             score = scores[tidx]
@@ -484,14 +513,24 @@ class VisionProcesser():
                 s = np.mean(s)
                 faces[frame].append({'track':tidx, 'score':float(s),'bbox':track['track']['bbox'][fidx]})
 
+        # Store face detection results for later visualization
+        for fidx, face_list in enumerate(faces):
+            if face_list:  # Only store if there are faces
+                global_frame_idx = fidx + frame_offset
+                self.vad_face_results[global_frame_idx] = face_list
+    
+    def draw_face_on_frame(self, frame, face_info):
+        """Draw face detection results on a frame"""
         colorDict = {0: 0, 1: 255}
-        for fidx, image in enumerate(frames):
-            for face in faces[fidx]:
-                clr = colorDict[int((face['score'] >= 0))]
-                txt = round(face['score'], 1)
-                cv2.rectangle(image, (int(face['bbox'][0]), int(face['bbox'][1])), (int(face['bbox'][2]), int(face['bbox'][3])),(0,clr,255-clr),10)
-                cv2.putText(image,'%s'%(txt), (int(face['bbox'][0]), int(face['bbox'][1])), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,clr,255-clr),5)
-            self.v_out.write(image)
+        clr = colorDict[int((face_info['score'] >= 0))]
+        txt = round(face_info['score'], 1)
+        cv2.rectangle(frame, 
+                     (int(face_info['bbox'][0]), int(face_info['bbox'][1])), 
+                     (int(face_info['bbox'][2]), int(face_info['bbox'][3])),
+                     (0, clr, 255-clr), 10)
+        cv2.putText(frame, '%s' % (txt), 
+                   (int(face_info['bbox'][0]), int(face_info['bbox'][1])), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, clr, 255-clr), 5)
     
     def save_face_tracks(self):
         """Save individual face tracks as MP4 files with audio"""
