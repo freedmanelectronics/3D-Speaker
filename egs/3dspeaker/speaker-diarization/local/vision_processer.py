@@ -28,6 +28,11 @@ import vision_tools.active_speaker_detection as active_speaker_detection
 import vision_tools.face_recognition as face_recognition
 import vision_tools.face_quality_assessment as face_quality_assessment
 
+from scenedetect.detectors import ContentDetector
+from scenedetect.scene_manager import SceneManager
+from scenedetect.stats_manager import StatsManager
+from scenedetect.video_manager import VideoManager
+
 
 class VisionProcesser():
     def __init__(
@@ -50,6 +55,7 @@ class VisionProcesser():
         # convert time interval to integer sampling point interval.
         audio_vad = [[int(i*16000), int(j*16000)] for (i, j) in audio_vad]
         self.video_id = os.path.basename(video_file_path).rsplit('.', 1)[0]
+        self.video_file_path = video_file_path
 
         # read video data
         self.cap = cv2.VideoCapture(video_file_path)
@@ -80,16 +86,18 @@ class VisionProcesser():
         self.crop_scale = conf['crop_scale']
         self.min_face_size = conf['min_face_size']
         self.face_det_stride = conf['face_det_stride']
-        self.shot_stride = conf['shot_stride']
+        self.shot_stride = conf.get('shot_stride', 50)  # Deprecated
         self.min_iou = conf['min_iou']
+        
+        # Scene detection configuration
+        self.scene_threshold = conf.get('scene_threshold', 27.0)
+        self.min_scene_length = conf.get('min_scene_length', 10)
         
         # Face track saving configuration
         self.track_video_fps = conf.get('track_video_fps', 25)
         self.include_audio_in_tracks = conf.get('include_audio_in_tracks', True)
         self.save_track_metadata = conf.get('save_track_metadata', True)
         self.min_avg_score_threshold = conf.get('min_avg_score_threshold', 0.5)
-        self.merge_tracks = conf.get('merge_tracks', True)
-        self.max_gap_frames = conf.get('max_gap_frames', 10)
         self.show_scores_on_frames = conf.get('show_scores_on_frames', False)
         self.disable_face_quality_check = conf.get('disable_face_quality_check', False)
 
@@ -108,31 +116,95 @@ class VisionProcesser():
             if self.face_track_dir:
                 os.makedirs(self.face_track_dir, exist_ok=True)
 
+    def detect_scenes(self, video_path):
+        """
+        Detect scenes in the video using scenedetect
+        
+        Returns:
+            List of tuples (start_frame, end_frame) for each scene
+        """
+        video_manager = VideoManager([video_path])
+        stats_manager = StatsManager()
+        scene_manager = SceneManager(stats_manager)
+        
+        # Add ContentDetector with threshold
+        scene_manager.add_detector(ContentDetector(threshold=self.scene_threshold))
+        
+        # Set downscale factor for faster processing
+        video_manager.set_downscale_factor()
+        
+        # Start video manager
+        video_manager.start()
+        
+        # Detect scenes
+        scene_manager.detect_scenes(frame_source=video_manager)
+        
+        # Get scene list
+        scene_list = scene_manager.get_scene_list()
+        
+        # Convert to frame numbers
+        scenes = []
+        for i, scene in enumerate(scene_list):
+            start_frame = scene[0].get_frames()
+            end_frame = scene[1].get_frames() - 1  # Exclusive to inclusive
+            
+            # Only include scenes longer than minimum length
+            if end_frame - start_frame + 1 >= self.min_scene_length:
+                scenes.append((start_frame, end_frame))
+        
+        # If no scenes detected, use entire video as one scene
+        if not scenes:
+            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            scenes = [(0, total_frames - 1)]
+        
+        print(f"Detected {len(scenes)} scenes in video")
+        
+        # Release video manager
+        video_manager.release()
+        
+        return scenes
+
     def run(self):
-        frames, face_det_frames = [], []
+        # First detect scenes in the entire video
+        print(f"Detecting scenes in video {self.video_id}...")
+        scenes = self.detect_scenes(self.video_file_path)
+        
+        # Process each VAD segment with scene boundaries
         for [audio_sample_st, audio_sample_ed] in self.audio_vad:
             # frame_st and frame_ed are the starting and ending frames of current interval.
             frame_st, frame_ed = int(audio_sample_st/640), int(audio_sample_ed/640)
-            num_frames = frame_ed - frame_st + 1
-            # go to frame 'frame_st'.
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_st)
-            index = 0
-            for _ in range(num_frames):
-                ret, frame = self.cap.read()
-                if not ret:
-                    break
-                if index % self.face_det_stride==0:
-                    face_det_frames.append(frame)
-                frames.append(frame)
-                if (index + 1) % self.shot_stride==0:
-                    audio = self.audio[(frame_st + index + 1 - self.shot_stride)*640:(frame_st + index + 1)*640]
-                    self.process_one_shot(frames, face_det_frames, audio, frame_st + index + 1 - self.shot_stride)
+            
+            # Find scenes that overlap with this VAD segment
+            for scene_start, scene_end in scenes:
+                # Check if scene overlaps with VAD segment
+                overlap_start = max(frame_st, scene_start)
+                overlap_end = min(frame_ed, scene_end)
+                
+                if overlap_start <= overlap_end:
+                    # Process this scene segment
                     frames, face_det_frames = [], []
-                index += 1
-            if len(frames) != 0:
-                audio = self.audio[(frame_st + index - len(frames))*640:(frame_st + index)*640]
-                self.process_one_shot(frames, face_det_frames, audio, frame_st + index - len(frames))
-                frames, face_det_frames = [], []
+                    
+                    # Set video position to start of overlap
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, overlap_start)
+                    
+                    # Read frames for this scene segment
+                    for frame_idx in range(overlap_start, overlap_end + 1):
+                        ret, frame = self.cap.read()
+                        if not ret:
+                            break
+                            
+                        if (frame_idx - overlap_start) % self.face_det_stride == 0:
+                            face_det_frames.append(frame)
+                        frames.append(frame)
+                    
+                    if len(frames) > 0:
+                        # Extract audio for this scene segment
+                        audio_start = overlap_start * 640
+                        audio_end = (overlap_end + 1) * 640
+                        audio = self.audio[audio_start:audio_end]
+                        
+                        # Process the scene segment
+                        self.process_one_shot(frames, face_det_frames, audio, overlap_start)
 
         self.cap.release()
         if self.out_video_path is not None:
